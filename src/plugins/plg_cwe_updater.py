@@ -54,7 +54,8 @@ class JSONDisk(diskcache.Disk):
         return data
 
 
-dc = diskcache.Cache(CACHE_FOLDER + CWE_FOLDER, disk=JSONDisk, disk_compress_level=6)
+# dc = diskcache.Cache(CACHE_FOLDER + CWE_FOLDER, disk=JSONDisk, disk_compress_level=6)
+dc = diskcache.Deque()
 
 
 class CWEHandler(ContentHandler):
@@ -115,7 +116,8 @@ class CWEUpdater(object):
                     LOGINFO_IF_ENABLED(SOURCE_MODULE, '[+] Complete parsing CWE data')
                     for cwe in cwe_handler.cwe:
                         cwe['description_summary'] = cwe['description_summary'].replace("\t\t\t\t\t", " ")
-                        parsed_items.append(cwe)
+                        item = {'tag': 'cwe', 'state':'parsed', 'data': cwe}
+                        parsed_items.append(item)
                     LOGINFO_IF_ENABLED(SOURCE_MODULE, "[===========================================================================]")
                     LOGINFO_IF_ENABLED(SOURCE_MODULE, '[+] CWE update complete at:'.format(datetime.utcnow()))
                     LOGINFO_IF_ENABLED(SOURCE_MODULE, '[+]     Processed:   {}'.format(len(parsed_items)))
@@ -143,13 +145,83 @@ class CWEUpdater(object):
         LOGINFO_IF_ENABLED(SOURCE_MODULE, '[+] Complete job')
         return result
 
-def test(data):
-    map(dc.store, data)
+
+
+
+from threading import Thread
+
+
+class UPDCWE(Thread):
+    def __init__(self, name, callback=None, callback_args=None, *args, **kwargs):
+        target = kwargs.pop('target')
+        super(UPDCWE, self).__init__(target=self.target_with_callback, *args, **kwargs)
+        self.callback = callback
+        self.method = target
+        self.callback_args = callback_args
+
+    def target_with_callback(self):
+        self.method()
+        if self.callback is not None:
+            self.callback(*self.callback_args)
+
+
+def jonb():
+    import time
+    dc.append({'message': 'test'})
+    dc.append({'message': 'test2'})
+    dc.append({'message': 'test3'})
+    time.sleep(3)
+
+def cb(args):
+    print('callback with args: {}'.format(args))
+    for d in list(dc):
+        print(d)
+
+def test2():
+    print('start test2')
+    thr = UPDCWE(
+        name='test2',
+        target=jonb,
+        callback=cb,
+        callback_args=('test 2 args',)
+        )
+    thr.start()
+
+
+class SetThread(Thread):
+    def __init__(self, name):
+        Thread.__init__(self)
+        self.name = name
+
+    def run(self):
+        dc.append({'message': 'test'})
+        dc.append({'message': 'test2'})
+        dc.append({'message': 'test3'})
+
+class GetThread(Thread):
+    def __init__(self, name):
+        Thread.__init__(self)
+        self.name = name
+
+    def run(self):
+        import time
+        time.sleep(3)
+        for d in list(dc):
+            print(d)
+
+
+def test():
+    th1 = SetThread('setThread')
+    th1.start()
+    th2 = GetThread('getThread')
+    th2.start()
 
 def main(argv):
     if argv:
         if argv[0] == 'test':
-            test([1,2,3,4,5])
+            test()
+        elif argv[0] == 'test2':
+            test2()
     else:
         cweUpdater = CWEUpdater(argv)
         cweUpdater.job()
