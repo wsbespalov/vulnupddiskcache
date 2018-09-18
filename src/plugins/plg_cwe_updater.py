@@ -1,33 +1,26 @@
 import os
 import sys
+import abc
 import time
 import json
 import zlib
-from threading import Thread
-from xml.sax import make_parser
-from xml.sax.handler import ContentHandler
-from datetime import datetime
+import enum
 
 baseDir = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
 sys.path.append(baseDir)
 
+from flask import Flask
+from datetime import datetime
+from xml.sax import make_parser
+from xml.sax.handler import ContentHandler
 from logger import LOGERR_IF_ENABLED, LOGINFO_IF_ENABLED
 from utils import get_file, get_module_name, check_internet_connection
 from settings import SETTINGS
 
+from diskcache import Deque
+
 SOURCE_MODULE = '[{0}] :: '.format(get_module_name(__file__))
 PLUGIN_NAME = get_module_name(__file__)
-
-CACHE_FOLDER = '/diskcache'
-CWE_FOLDER = '/cwe'
-TAG = u'cwe'
-
-if not os.path.exists(os.path.join(baseDir, CACHE_FOLDER + CWE_FOLDER)):
-    os.makedirs(os.path.join(baseDir, CACHE_FOLDER + CWE_FOLDER))
-
-import diskcache
-
-dc = diskcache.Deque()
 
 
 class CWEHandler(ContentHandler):
@@ -60,208 +53,119 @@ class CWEHandler(ContentHandler):
     def endElement(self, name):
         if name == 'Description_Summary' and self.weakness_tag:
             self.description_summary_tag = False
-            self.description_summary = self.description_summary + \
-                                       self.description_summary
-            self.cwe[-1]['description_summary'] = \
-                self.description_summary.replace("\n", "")
+            self.description_summary = self.description_summary + self.description_summary
+            self.cwe[-1]['description_summary'] = self.description_summary.replace("\n", "")
         elif name == 'Weakness':
             self.weakness_tag = False
 
-class CWEUpdater(object):
 
-    def __init__(self, argv):
+
+class State(enum.Enum):
+    start = 1
+    pending = 2
+    downloading = 3
+    parsing = 4
+    caching_local = 5
+    caching_global = 6
+    idle = 7
+
+
+
+class CWEUpdater:
+    """
+    CWE Updater State Machine.
+    Know its observers to Notify it.
+    Any number of Observer objects may observe a subject.
+    Send a notification to its observers when its state changes.
+    """
+
+    def __init__(self):
+        self._observers = set()
+        self._subject_state = None
+
+    def attach(self, observer):
+        observer._subject = self
+        self._observers.add(observer)
+
+    def detach(self, observer):
+        observer._subject = None
+        self._observers.discard(observer)
+
+    def _notify(self):
+        for observer in self._observers:
+            observer.update(self._subject_state)
+
+    @property
+    def subject_state(self):
+        return self._subject_state
+
+    @subject_state.setter
+    def subject_state(self, arg):
+        self._subject_state = arg
+        self._notify()
+
+    def start(self):
+        self.subject_state = State.start.value
+        time.sleep(1)
+        self.subject_state = State.downloading.value
+        time.sleep(1)
+        self.subject_state = State.parsing.value
+        time.sleep(1)
+        self.subject_state = State.idle.value
+
+
+class Observer(metaclass=abc.ABCMeta):
+    """
+    Define an updating interface for objects that should be notified of
+    changes in a subject.
+    """
+
+    def __init__(self):
+        self._subject = None
+        self._observer_state = None
+
+    @abc.abstractmethod
+    def update(self, arg):
         pass
 
-    def update_cwe(self):
-        parsed_items= []
-        if check_internet_connection():
-            parser = make_parser()
-            cwe_handler = CWEHandler()
-            parser.setContentHandler(cwe_handler)
-            source = SETTINGS.get("cwe", {}).get("source", "http://cwe.mitre.org/data/xml/cwec_v2.8.xml.zip")
-            try:
-                LOGINFO_IF_ENABLED(SOURCE_MODULE, '[+] Start downloading file')
-                data, response = get_file(getfile=source)
-                if 'error' not in response:
-                    LOGINFO_IF_ENABLED(SOURCE_MODULE, '[+] Start parsing CWE data')
-                    parser.parse(data)
-                    LOGINFO_IF_ENABLED(SOURCE_MODULE, '[+] Complete parsing CWE data')
-                    for cwe in cwe_handler.cwe:
-                        cwe['description_summary'] = cwe['description_summary'].replace("\t\t\t\t\t", " ")
-                        item = {'tag': 'cwe', 'state':'parsed', 'data': cwe}
-                        parsed_items.append(item)
-                    LOGINFO_IF_ENABLED(SOURCE_MODULE, "[===========================================================================]")
-                    LOGINFO_IF_ENABLED(SOURCE_MODULE, '[+] CWE update complete at:'.format(datetime.utcnow()))
-                    LOGINFO_IF_ENABLED(SOURCE_MODULE, '[+]     Processed:   {}'.format(len(parsed_items)))
-                    LOGINFO_IF_ENABLED(SOURCE_MODULE, "[===========================================================================]")
-                    return parsed_items
-                else:
-                    LOGERR_IF_ENABLED(SOURCE_MODULE, '[-] There are some errors in server response: {}'.format(response))
-            except Exception as ex:
-                LOGERR_IF_ENABLED(SOURCE_MODULE, "Got exception during downloading CWE source: {0}".format(ex))
-                return []
-        else:
-            LOGERR_IF_ENABLED(SOURCE_MODULE, '[-] No internet connection!')
-            return []
 
-    def job(self):
-        LOGINFO_IF_ENABLED(SOURCE_MODULE, '[+] Start job')
-        parsed_items = self.update_cwe()
-        if len(parsed_items) != 0:
-            result = True
-            return True
-        else:
-            LOGINFO_IF_ENABLED(SOURCE_MODULE, '[-] Parser returns empty list, nothing to process.')
-            result = False
-        LOGINFO_IF_ENABLED(SOURCE_MODULE, '[+] Complete job')
-        return result
+class CWEUpdaterLogObserver(Observer):
+    """
+    Implement the Observer updating interface to keep its state consistent with the subject's.
+    Store state that should stay consistent with the subject's.
+    Notify User by LOGGER.
+    """
 
-################# 3
-
-class UPDCWEThreadClass(Thread):
-    def __init__(self, name, callback=None, callback_args=None, *args, **kwargs):
-        target = kwargs.pop('target')
-        super(UPDCWEThreadClass, self).__init__(target=self.target_with_callback, *args, **kwargs)
-        self.callback = callback
-        self.method = target
-        self.callback_args = callback_args
-
-    def target_with_callback(self):
-        self.method()
-        if self.callback is not None:
-            self.callback(*self.callback_args)
-
-def update_cwe_job():
-    parsed_items= []
-    if check_internet_connection():
-        parser = make_parser()
-        cwe_handler = CWEHandler()
-        parser.setContentHandler(cwe_handler)
-        source = SETTINGS.get("cwe", {}).get("source", "http://cwe.mitre.org/data/xml/cwec_v2.8.xml.zip")
-        try:
-            LOGINFO_IF_ENABLED(SOURCE_MODULE, '[+] Start downloading file')
-            data, response = get_file(getfile=source)
-            if 'error' not in response:
-                LOGINFO_IF_ENABLED(SOURCE_MODULE, '[+] Start parsing CWE data')
-                parser.parse(data)
-                LOGINFO_IF_ENABLED(SOURCE_MODULE, '[+] Complete parsing CWE data')
-                for cwe in cwe_handler.cwe:
-                    cwe['description_summary'] = cwe['description_summary'].replace("\t\t\t\t\t", " ")
-                    item = {'tag': 'cwe', 'state':'parsed', 'data': cwe}
-                    parsed_items.append(item)
-                    #
-                    dc.append(item)
-                    #
-                LOGINFO_IF_ENABLED(SOURCE_MODULE, "[===========================================================================]")
-                LOGINFO_IF_ENABLED(SOURCE_MODULE, '[+] CWE update complete at:'.format(datetime.utcnow()))
-                LOGINFO_IF_ENABLED(SOURCE_MODULE, '[+]     Processed:   {}'.format(len(parsed_items)))
-                LOGINFO_IF_ENABLED(SOURCE_MODULE, "[===========================================================================]")
-                return parsed_items
-            else:
-                LOGERR_IF_ENABLED(SOURCE_MODULE, '[-] There are some errors in server response: {}'.format(response))
-        except Exception as ex:
-            LOGERR_IF_ENABLED(SOURCE_MODULE, "Got exception during downloading CWE source: {0}".format(ex))
-            return []
-    else:
-        LOGERR_IF_ENABLED(SOURCE_MODULE, '[-] No internet connection!')
-        return []
+    def update(self, state):
+        self._observer_state = state
+        LOGINFO_IF_ENABLED(SOURCE_MODULE, '[s] Set state as: {}'.format(state))
 
 
-def cwe_complete_callback(args):
-    print('callback with args: {}'.format(args))
-    print(len(dc))
+class CWEUpdaterRedisObserver(Observer):
+    """
+    Implement the Observer updating interface to keep its state consistent with the subject's.
+    Store state that should stay consistent with the subject's.
+    Notify User by REDIS.
+    """
 
-def test3():
-    print('start test 3')
-    thr = UPDCWEThreadClass(
-        name='UPDCWEThreadClass',
-        target=update_cwe_job,
-        callback=cwe_complete_callback,
-        callback_args=('test 3 args',)
-        )
-    thr.start()
-
-################# 2
+    def update(self, state):
+        self._observer_state = state
+        print('*** Set Redis state: {}'.format(state))
 
 
+def main():
+    cwe_updater_machine = CWEUpdater()
 
-class UPDCWE(Thread):
-    def __init__(self, name, callback=None, callback_args=None, *args, **kwargs):
-        target = kwargs.pop('target')
-        super(UPDCWE, self).__init__(target=self.target_with_callback, *args, **kwargs)
-        self.callback = callback
-        self.method = target
-        self.callback_args = callback_args
+    cwe_updater_log_observer = CWEUpdaterLogObserver()
+    cwe_updater_machine.attach(cwe_updater_log_observer)
 
-    def target_with_callback(self):
-        self.method()
-        if self.callback is not None:
-            self.callback(*self.callback_args)
+    cwe_updater_redis_observer = CWEUpdaterRedisObserver()
+    cwe_updater_machine.attach(cwe_updater_redis_observer)
 
+    cwe_updater_machine.subject_state = State.idle.value
+    cwe_updater_machine.start()
 
-def jonb():
-    import time
-    dc.append({'message': 'test'})
-    dc.append({'message': 'test2'})
-    dc.append({'message': 'test3'})
-    time.sleep(3)
-
-def cb(args):
-    print('callback with args: {}'.format(args))
-    for d in list(dc):
-        print(d)
-
-def test2():
-    print('start test2')
-    thr = UPDCWE(
-        name='test2',
-        target=jonb,
-        callback=cb,
-        callback_args=('test 2 args',)
-        )
-    thr.start()
-
-################# 1
-
-class SetThread(Thread):
-    def __init__(self, name):
-        Thread.__init__(self)
-        self.name = name
-
-    def run(self):
-        dc.append({'message': 'test'})
-        dc.append({'message': 'test2'})
-        dc.append({'message': 'test3'})
-
-class GetThread(Thread):
-    def __init__(self, name):
-        Thread.__init__(self)
-        self.name = name
-
-    def run(self):
-        import time
-        time.sleep(3)
-        for d in list(dc):
-            print(d)
-
-
-def test():
-    th1 = SetThread('setThread')
-    th1.start()
-    th2 = GetThread('getThread')
-    th2.start()
-
-def main(argv):
-    if argv:
-        if argv[0] == 'test':
-            test()
-        elif argv[0] == 'test2':
-            test2()
-        elif argv[0] == 'test3':
-            test3()
-    else:
-        cweUpdater = CWEUpdater(argv)
-        cweUpdater.job()
 
 if __name__ == '__main__':
-    sys.exit(main(sys.argv[1:]))
+    main()
+
